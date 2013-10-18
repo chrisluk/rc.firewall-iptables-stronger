@@ -1,0 +1,531 @@
+#!/bin/sh
+#
+# rc.firewall-iptables-stronger
+# Log: 0.88f - Based on 0.88s rc.firewall-iptables-stronger and removed IP Masquerade support.
+
+# Change log
+# 20131015 - Version: 0.95
+# - added port 443 outing to -web option
+#
+# 20131003 - Version: 0.94
+# - added code to extract ip from kernel major version 3
+# - modified local array declation
+#
+# 20120626 - Version: 0.93
+# - added flag support for DstIP/SrcIP on Optional_Input, Optional_Output
+#
+# 20120626 - Version: 0.92
+# - added flag support for SwapIP, SwapPort and BCast on Optional_Input, Optional_Output
+#
+# 20100630 - Version: 0.91
+# - added INTERFACE variable on conf file
+# - added NO_RESET_RULE option
+# - added NO_CATCH_ALL option
+
+# variables
+FWVER=0.88f
+FWVER2=0.95
+
+# Set default value before loading configuration information
+INPUT_FILTER_COUNT=0
+OUTPUT_FILTER_COUNT=0
+NO_RESET_RULE=0
+NO_CATCH_ALL=0
+NO_INCOMING_BLOCK=0
+NO_OUTGOING_BLOCK=0
+ICMP_ENABLE=0
+REGLOG_ENABLE=0
+
+# Get the configuration information from /etc/rc.d/rc.firewall-iptables-stronger.conf:
+. $0.conf
+
+# The location of various iptables and other shell programs
+IPTABLES_DEFAULT=/usr/sbin/iptables
+IPTABLES_LOCAL=/usr/local/sbin/iptables
+ECHO=/bin/echo
+GREP=/usr/bin/grep
+AWK=/usr/bin/awk
+CUT=/bin/cut
+UNAME=/usr/bin/uname
+IFCONFIG=/sbin/ifconfig
+EXEC=eval;export LD_RUN_PATH=/usr/local/lib
+
+# function
+function Optional_Input {
+        local SERVICE=${1}
+        local OPENPORT=${2}
+        local PROTOCOL="tcp"
+        local INCOMINGIP=${UNIVERSE}
+        local POLICY="ACCEPT"
+        local HITCOUNT="0"
+        local TIMEFRAME="60"
+        local DSTIP=${EXTIP}
+        local -a FLAG
+        local i
+        local j
+        local swaptmp=""
+        local MODE=""
+        local PORTROLE="--dport"
+
+        if [ -n "${1}" ] && [ -n "${2}" ]; then
+                if [ -n "${3}" ]; then
+                        local PROTOCOL=${3}
+                fi
+                if [ -n "${4}" ]; then
+                        local INCOMINGIP=${4}
+                fi
+                if [ -n "${5}" ]; then
+                        case "${5}" in
+                        "ACCEPT" | "DROP" | "REJECT" | "QUEUE" )
+                                local POLICY=${5}
+                                ;;
+                        * )
+                                local POLICY="ACCEPT"
+                                ;;
+                        esac
+                fi
+
+                if [ -n "${8}" ]; then
+                        for i in $( echo ${8} | tr ";" "\n")
+                        do
+                                FLAG[ j++]="`echo ${i} | tr '[:lower:]' '[:upper:]'`"
+                                #echo "$j: ${FLAG[ $j - 1]}"
+
+                                if [ "${FLAG[ $j - 1]}" == "SWAPIP" ]; then
+                                        #echo "SWAP IP: SRC: ${INCOMINGIP} DST: ${DSTIP}"
+                                        SWAPTMP=${DSTIP}
+                                        DSTIP=${INCOMINGIP}
+                                        INCOMINGIP=${SWAPTMP}
+                                        MODE="${MODE}SwapIP/${INCOMINGIP} "
+                                fi
+
+                                if [ "${FLAG[ $j - 1]}" == "SWAPPORT" ]; then
+                                        #echo "SWAP PORT: --sport ${OPENPORT}"
+                                        PORTROLE="--sport"
+                                        MODE="${MODE}SwapPort/SPort:${OPENPORT} "
+                                fi
+
+                                if [ "${FLAG[ $j - 1]}" == "BCAST" ]; then
+                                        #echo "BCast: SRC: ${UNIVERSE} DST: ${INCOMINGIP}"
+                                        DSTIP=${INCOMINGIP}
+                                        INCOMINGIP=${UNIVERSE}
+                                        MODE="${MODE}BCast/${DSTIP} "
+                                fi
+
+                                if [ "${FLAG[ $j - 1]}" == "DSTIP" ]; then
+                                        #echo "Destination IP: SRC: ${UNIVERSE} DST: ${INCOMINGIP}"
+                                        DSTIP=${INCOMINGIP}
+                                        INCOMINGIP=${UNIVERSE}
+                                        MODE="${MODE}DstIP/${DSTIP} "
+                                fi
+                        done
+                fi
+
+                if [ -n "${6}" ] && [ "${6}" -gt "$HITCOUNT" ] && [ "${POLICY}"="ACCEPT" ]; then
+                        local HITCOUNT=${6}
+                        if [ -n "${7}" ]; then
+                                local TIMEFRAME=${7}
+                        fi
+                        ${EXEC} "${ECHO} -e \"      - ${MODE}Rate limit EXTERNAL ${PROTOCOL} access from ${INCOMINGIP} to SERVICE:${SERVICE} at PORT:${OPENPORT}\" with ${HITCOUNT} hits in ${TIMEFRAME} seconds"
+                        ${EXEC} "${IPTABLES} -A INPUT -i ${EXTIF} -p ${PROTOCOL} -s ${INCOMINGIP} -d ${DSTIP} ${PORTROLE} ${OPENPORT} -m state --state NEW -m recent --update --name ${SERVICE} --seconds ${TIMEFRAME} --hitcount ${HITCOUNT} -j DROP"
+                        ${EXEC} "${IPTABLES} -A INPUT -i ${EXTIF} -p ${PROTOCOL} -s ${INCOMINGIP} -d ${DSTIP} ${PORTROLE} ${OPENPORT} -m state --state NEW -m recent --set --name ${SERVICE}"
+                fi
+
+                ${EXEC} "${ECHO} -e \"      - ${MODE}${POLICY} EXTERNAL ${PROTOCOL} access from ${INCOMINGIP} to SERVICE:${SERVICE} at PORT:${OPENPORT}\""
+                ${EXEC} "${IPTABLES} -A INPUT -i ${EXTIF} -m state --state NEW,ESTABLISHED,RELATED -p ${PROTOCOL} -s ${INCOMINGIP} -d ${DSTIP} ${PORTROLE} ${OPENPORT} -j ${POLICY}"
+        fi
+}
+
+function Optional_Output {
+        local SERVICE=${1}
+        local OPENPORT=${2}
+        local PROTOCOL="tcp"
+        local OUTGOINGIP=${UNIVERSE}
+        local POLICY="ACCEPT"
+        local HITCOUNT="0"
+        local TIMEFRAME="60"
+        local SRCIP=${EXTIP}
+        local -a FLAG
+        local i
+        local j
+        local swaptmp=""
+        local MODE=""
+        local PORTROLE="--dport"
+
+        if [ -n "${1}" ] && [ -n "${2}" ]; then
+                if [ -n "${3}" ]; then
+                        local PROTOCOL=${3}
+                fi
+                if [ -n "${4}" ]; then
+                        local OUTGOINGIP=${4}
+                fi
+                if [ -n "${5}" ]; then
+                        case "${5}" in
+                        "ACCEPT" | "DROP" | "REJECT" | "QUEUE" )
+                                local POLICY=${5}
+                                ;;
+                        * )
+                                local POLICY="ACCEPT"
+                                ;;
+                        esac
+                fi
+
+                if [ -n "${8}" ]; then
+                        for i in $( echo ${8} | tr ";" "\n")
+                        do
+                                FLAG[ j++]="`echo ${i} | tr '[:lower:]' '[:upper:]'`"
+                                #echo "$j: ${FLAG[ $j - 1]}"
+
+                                if [ "${FLAG[ $j - 1]}" == "SWAPIP" ]; then
+                                        #echo "SWAP IP: SRC: ${SRCIP} DST: ${OUTGOINGIP}"
+                                        SWAPTMP=${SRCIP}
+                                        SRCIP=${OUTGOINGIP}
+                                        OUTGOINGIP=${SWAPTMP}
+                                        MODE="${MODE}SwapIP/${OUTGOINGIP} "
+                                fi
+
+                                if [ "${FLAG[ $j - 1]}" == "SWAPPORT" ]; then
+                                        #echo "SWAP PORT: --sport ${OPENPORT}"
+                                        PORTROLE="--sport"
+                                        MODE="${MODE}SwapPort/SPort:${OPENPORT} "
+                                fi
+
+                                if [ "${FLAG[ $j - 1]}" == "SRCIP" ]; then
+                                        #echo "SOURCE IP: SRC: ${OUTGOINGIP} DST: ${UNIVERSE}"
+                                        SRCIP=${OUTGOINGIP}
+                                        OUTGOINGIP=${UNIVERSE}
+                                        MODE="${MODE}SrcIP/${OUTGOINGIP} "
+                                fi
+                        done
+                fi
+
+                if [ -n "${6}" ] && [ "${6}" -gt "$HITCOUNT" ] && [ "${POLICY}"="ACCEPT" ]; then
+                        local HITCOUNT=${6}
+                        if [ -n "${7}" ]; then
+                                local TIMEFRAME=${7}
+                        fi
+                        ${EXEC} "${ECHO} -e \"      - ${MODE}Rate limit EXTERNAL ${PROTOCOL} access to ${OUTGOINGIP} for SERVICE:${SERVICE} at PORT:${OPENPORT}\" with ${HITCOUNT} hits in ${TIMEFRAME} seconds"
+                        ${EXEC} "${IPTABLES} -A OUTPUT -o ${EXTIF} -p ${PROTOCOL} -s ${SRCIP} -d ${OUTGOINGIP} ${PORTROLE} ${OPENPORT} -m state --state NEW -m recent --update --name ${SERVICE} --seconds ${TIMEFRAME} --hitcount ${HITCOUNT} -j DROP"
+                        ${EXEC} "${IPTABLES} -A OUTPUT -o ${EXTIF} -p ${PROTOCOL} -s ${SRCIP} -d ${OUTGOINGIP} ${PORTROLE} ${OPENPORT} -m state --state NEW -m recent --set --name ${SERVICE}"
+                fi
+
+                ${EXEC} "${ECHO} -e \"      - ${MODE}${POLICY} EXTERNAL ${PROTOCOL} access to ${OUTGOINGIP} for SERVICE:${SERVICE} at PORT:${OPENPORT}\""
+                ${EXEC} "${IPTABLES} -A OUTPUT -o ${EXTIF} -m state --state NEW,ESTABLISHED,RELATED -p ${PROTOCOL} -s ${SRCIP} -d ${OUTGOINGIP} ${PORTROLE} ${OPENPORT} -j ${POLICY}"
+        fi
+}
+
+# Parameters check
+until [ -z "$1" ]  # Until all parameters used up...
+do
+        if [ "$1" = "-d" ]; then
+                EXEC=${ECHO}
+        fi
+        if [ "$1" = "--disable-reset-rule" ] || [ "$1" = "-carry-rule" ]; then
+                NO_RESET_RULE=1
+        fi
+        if [ "$1" = "--disable-catch-all" ] || [ "$1" = "-no-catch-all" ]; then
+                NO_CATCH_ALL=1
+        fi
+        if [ "$1" = "--disable-incoming-block" ] || [ "$1" = "-open-in" ]; then
+                NO_INCOMING_BLOCK=1
+        fi
+        if [ "$1" = "--disable-outgoing-block" ] || [ "$1" = "-open-out" ]; then
+                NO_OUTGOING_BLOCK=1
+        fi
+        if [ "$1" = "--enable-icmp" ] || [ "$1" = "-icmp" ]; then
+                ICMP_ENABLE=1
+        fi
+        if [ "$1" = "--enable-regject-log" ] || [ "$1" = "-reglog" ]; then
+                REGLOG_ENABLE=1
+        fi
+
+        # default services port
+
+        if [ "$1" = "--enable-service-psql" ] || [ "$1" = "-5432" ]; then
+                INPUT_FILTER[ INPUT_FILTER_COUNT++]="psql 5432"
+        fi
+        if [ "$1" = "--enable-service-mysql" ] || [ "$1" = "-3306" ]; then
+                INPUT_FILTER[ INPUT_FILTER_COUNT++]="mysql 3306"
+        fi
+        if [ "$1" = "--enable-service-http" ] || [ "$1" = "-80" ]; then
+                INPUT_FILTER[ INPUT_FILTER_COUNT++]="http 80"
+        fi
+        if [ "$1" = "--enable-service-https" ] || [ "$1" = "-443" ]; then
+                INPUT_FILTER[ INPUT_FILTER_COUNT++]="https 443"
+        fi
+        if [ "$1" = "--enable-service-snmp" ] || [ "$1" = "-161" ]; then
+                INPUT_FILTER[ INPUT_FILTER_COUNT++]="snmp 161"
+        fi
+        if [ "$1" = "--enable-service-ssh" ] || [ "$1" = "-1022" ]; then
+                INPUT_FILTER[ INPUT_FILTER_COUNT++]="ssh 1022"
+        fi
+
+        # default access port
+
+        if [ "$1" = "--enable-access-web" ] || [ "$1" = "-web" ]; then
+                OUTPUT_FILTER[ OUTPUT_FILTER_COUNT++]="http 80"
+                OUTPUT_FILTER[ OUTPUT_FILTER_COUNT++]="https 443"
+                OUTPUT_FILTER[ OUTPUT_FILTER_COUNT++]="ftp 21"
+                OUTPUT_FILTER[ OUTPUT_FILTER_COUNT++]="ftp-data 20"
+        fi
+        if [ "$1" = "--enable-access-ssh" ] || [ "$1" = "-ssh" ]; then
+                OUTPUT_FILTER[ OUTPUT_FILTER_COUNT++]="ssh 1022"
+                OUTPUT_FILTER[ OUTPUT_FILTER_COUNT++]="ssh 22"
+        fi
+        if [ "$1" = "--enable-access-mail" ] || [ "$1" = "-mail" ]; then
+                OUTPUT_FILTER[ OUTPUT_FILTER_COUNT++]="smtp 25"
+                OUTPUT_FILTER[ OUTPUT_FILTER_COUNT++]="submission 587"
+        fi
+
+        shift
+done
+
+if [ -x ${IPTABLES_LOCAL} ]; then
+        IPTABLES=${IPTABLES_LOCAL}
+elif [ -x ${IPTABLES_DEFAULT} ]; then
+        IPTABLES=${IPTABLES_DEFAULT}
+else
+        ${EXEC} "${ECHO} -e \"\niptables binaries not found. disable firewall script.\n\""
+        exit 1
+fi
+
+#
+${EXEC} "${ECHO} -e \"\nLoading rc.firewall-iptables-STRONGER - version ${FWVER}/${FWVER2}..\n\""
+
+# Setting the interface for the network, modified on 20100630
+EXTIF="eth0"
+if [ -n "${INTERFACE}" ]; then
+        EXTIF="${INTERFACE}"
+fi
+${EXEC} "${ECHO} \"  External Interface:  ${EXTIF}\""
+
+# Determine the external IP automatically by kernel major version:
+if [ "`${UNAME} -r | ${CUT} -d. -f1`" = "2" ]; then
+	EXTIP="`${IFCONFIG} ${EXTIF} | ${AWK} /${EXTIF}/'{next}//{split($0,a,":");split(a[2],a," ");print a[1];exit}'`"
+	EXTBC="`${IFCONFIG} ${EXTIF} | ${AWK} /${EXTIF}/'{next}//{split($0,a,":");split(a[3],a," ");print a[1];exit}'`"
+else
+	EXTIP="`${IFCONFIG} ${EXTIF} | ${AWK} /${EXTIF}/'{next}//{split($0,a," ");split(a[2],a," ");print a[1];exit}'`"
+	EXTBC="`${IFCONFIG} ${EXTIF} | ${AWK} /${EXTIF}/'{next}//{split($0,a," ");split(a[4],a," ");print a[1];exit}'`"
+fi
+
+# Print ouf external IP
+if [ -n "${EXTIP}" ]; then
+        ${EXEC} "${ECHO} \"  External IP: ${EXTIP}\""
+        ${EXEC} "${ECHO} \"  External BCast: ${EXTBC}\""
+else
+        ${EXEC} "${ECHO} \"  Unable to determine External IP, script terminated.\""
+        exit 1
+fi
+
+# strip off :* if interface is an alias, 20100630
+EXTIF=${EXTIF%:*}
+
+# Setting a few other local variables
+UNIVERSE="0.0.0.0/0"
+
+#############################################################################
+#
+#Clearing any previous configuration
+#
+#  Unless specified, the defaults for INPUT, OUTPUT, and FORWARD to DROP
+#
+#    You CANNOT change this to REJECT as it isn't a vaild policy setting.
+#    If you want REJECT, you must explictly REJECT at the end of a giving
+#    INPUT, OUTPUT, or FORWARD chain
+#
+
+if [ "${NO_RESET_RULE}" = "1" ]; then
+
+        ${EXEC} "${ECHO} \"  Carry existing rules and policy ..\""
+
+else
+
+        ${EXEC} "${ECHO} \"  Clearing any existing rules and setting default policy to DROP..\""
+        ${EXEC} "${IPTABLES} -P INPUT DROP"
+        ${EXEC} "${IPTABLES} -F INPUT"
+        ${EXEC} "${IPTABLES} -P OUTPUT DROP"
+        ${EXEC} "${IPTABLES} -F OUTPUT"
+        ${EXEC} "${IPTABLES} -P FORWARD DROP"
+        ${EXEC} "${IPTABLES} -F FORWARD"
+
+        ${EXEC} "${IPTABLES} -F REG-LOG"
+
+        # Delete all User-specified chains
+        ${EXEC} "${ECHO} \"  Delete all User-specified chains..\""
+        ${EXEC} "${IPTABLES} -X"
+
+        # Reset all IPTABLES counters
+        ${EXEC} "${ECHO} \"  Reset all IPTABLES counters..\""
+        ${EXEC} "${IPTABLES} -Z"
+
+#Configuring specific CHAINS for later use in the ruleset
+#
+#  NOTE:  Some users prefer to have their firewall silently
+#         "DROP" packets while others prefer to use "REJECT"
+#         to send ICMP error messages back to the remote
+#         machine.  The default is "REJECT" but feel free to
+#         change this below.
+#
+# NOTE: Without the --log-level set to "info", every single
+#       firewall hit will goto ALL vtys.  This is a very big
+#       pain.
+#
+        ${EXEC} "${ECHO} \"  Creating a DROP chain..\""
+        #${EXEC} "${IPTABLES} -F REG-LOG"
+        ${EXEC} "${IPTABLES} -N REG-LOG"
+        ${EXEC} "${IPTABLES} -A REG-LOG -j LOG --log-level info"
+        ${EXEC} "${IPTABLES} -A REG-LOG -j REJECT"
+
+fi
+
+${EXEC} "${ECHO} -e \"\n   - Loading INPUT rulesets\n\""
+
+
+#######################################################################
+# INPUT: Incoming traffic from various interfaces.  All rulesets are
+#        already flushed and set to a default policy of DROP.
+#
+
+# loopback interfaces are valid.
+${EXEC} "${IPTABLES} -A INPUT -i lo -s ${UNIVERSE} -d ${UNIVERSE} -j ACCEPT"
+
+# external interface, from any source, for ICMP traffic is valid
+if [ "${ICMP_ENABLE}" = "1" ]; then
+        ${EXEC} "${ECHO} -e \"      - ICMP enable, i.e. ping enable\""
+        ${EXEC} "${IPTABLES} -A INPUT -i ${EXTIF} -p ICMP -s ${UNIVERSE} -d $EXTIP -j ACCEPT"
+fi
+
+# remote interface, any source, going to the external IP address is valid
+# i.e. no incoming block
+if [ "${NO_INCOMING_BLOCK}" = "1" ]; then
+        ${EXEC} "${ECHO} -e \"      - No incoming block\""
+        ${EXEC} "${IPTABLES} -A INPUT -i ${EXTIF} -s ${UNIVERSE} -d $EXTIP -j ACCEPT"
+fi
+
+# Allow any related traffic coming back to the MASQ server in.
+#
+#  STATEFULLY TRACKED
+#
+# i.e. packets sent, returned from different port, e.g. DNS, HTTP request
+#
+${EXEC} "${IPTABLES} -A INPUT -i ${EXTIF} -s ${UNIVERSE} -d $EXTIP -m state --state ESTABLISHED,RELATED -j ACCEPT"
+
+
+# ----- Begin OPTIONAL INPUT Section -----
+#
+
+for (( i=0; i < ${INPUT_FILTER_COUNT}; i++)); do
+        TMP_SERVICE[0]=""
+        TMP_SERVICE[1]=""
+        TMP_SERVICE[2]=""
+        TMP_SERVICE[3]=""
+        TMP_SERVICE[4]=""
+        TMP_SERVICE[5]=""
+        TMP_SERVICE[6]=""
+        TMP_SERVICE[7]=""
+        k=0
+        for j in ${INPUT_FILTER[ ${i}]}; do
+                TMP_SERVICE[k++]="${j}"
+        done
+        Optional_Input ${TMP_SERVICE[0]} ${TMP_SERVICE[1]} ${TMP_SERVICE[2]} ${TMP_SERVICE[3]} ${TMP_SERVICE[4]} ${TMP_SERVICE[5]} ${TMP_SERVICE[6]} ${TMP_SERVICE[7]}
+done
+
+#
+# ----- End OPTIONAL INPUT Section -----
+
+
+# Catch all rule, all other incoming is denied and logged.
+#
+if [ "${NO_CATCH_ALL}" = "1" ]; then
+
+        ${EXEC} "${ECHO} -e \"      - All other incoming left untouched\""
+
+else
+
+        if [ "${REGLOG_ENABLE}" = "1" ]; then
+                ${EXEC} "${ECHO} -e \"      - All other incoming reject and logged\""
+                ${EXEC} "${IPTABLES} -A INPUT -s ${UNIVERSE} -d ${UNIVERSE} -j REG-LOG"
+        else
+                ${EXEC} "${ECHO} -e \"      - All other incoming dropped\""
+                ${EXEC} "${IPTABLES} -A INPUT -s ${UNIVERSE} -d ${UNIVERSE} -j DROP"
+        fi
+fi
+
+
+# ---------------------------------------------------------------------
+
+${EXEC} "${ECHO} -e \"\n   - Loading OUTPUT rulesets\n\""
+
+#######################################################################
+# OUTPUT: Outgoing traffic from various interfaces.  All rulesets are
+#         already flushed and set to a default policy of DROP.
+#
+
+# Workaround bug in netfilter
+${EXEC} "${IPTABLES} -A OUTPUT -m state -p icmp --state INVALID -j DROP"
+
+# loopback interface is valid.
+${EXEC} "${IPTABLES} -A OUTPUT -o lo -s ${UNIVERSE} -d ${UNIVERSE} -j ACCEPT"
+
+# external interface, to any source, for ICMP traffic is valid
+if [ "${ICMP_ENABLE}" = "1" ]; then
+        ${EXEC} "${ECHO} -e \"      - ICMP enable, i.e. ping enable\""
+        ${EXEC} "${IPTABLES} -A OUTPUT -o ${EXTIF} -p ICMP -s $EXTIP -d ${UNIVERSE} -j ACCEPT"
+fi
+
+# anything else outgoing on remote interface is valid
+# i.e. no outgoing block
+if [ "${NO_OUTGOING_BLOCK}" = "1" ]; then
+        ${EXEC} "${ECHO} -e \"      - No outgoing block\""
+        ${EXEC} "${IPTABLES} -A OUTPUT -o ${EXTIF} -s $EXTIP -d ${UNIVERSE} -j ACCEPT"
+fi
+
+# Allow any related traffic to go out
+#
+#  STATEFULLY TRACKED
+#
+${EXEC} "${IPTABLES} -A OUTPUT -o ${EXTIF} -s $EXTIP -d ${UNIVERSE} -m state --state ESTABLISHED,RELATED -j ACCEPT"
+
+
+# ----- Begin OPTIONAL OUTPUT Section -----
+#
+
+for (( i=0; i < ${OUTPUT_FILTER_COUNT}; i++)); do
+        TMP_SERVICE[0]=""
+        TMP_SERVICE[1]=""
+        TMP_SERVICE[2]=""
+        TMP_SERVICE[3]=""
+        TMP_SERVICE[4]=""
+        TMP_SERVICE[5]=""
+        TMP_SERVICE[6]=""
+        TMP_SERVICE[7]=""
+        k=0
+        for j in ${OUTPUT_FILTER[ ${i}]}; do
+                TMP_SERVICE[k++]="${j}"
+        done
+        Optional_Output ${TMP_SERVICE[0]} ${TMP_SERVICE[1]} ${TMP_SERVICE[2]} ${TMP_SERVICE[3]} ${TMP_SERVICE[4]} ${TMP_SERVICE[5]} ${TMP_SERVICE[6]} ${TMP_SERVICE[7]}
+done
+
+#
+# ----- End OPTIONAL OUTPUT Section -----
+
+# Catch all rule, all other outgoing is denied and logged.
+if [ "${NO_CATCH_ALL}" = "1" ]; then
+
+        ${EXEC} "${ECHO} -e \"      - All other outgoing left untouched\""
+
+else
+
+        if [ "${REGLOG_ENABLE}" = "1" ]; then
+                ${EXEC} "${ECHO} -e \"      - All other outgoing reject and logged\""
+                ${EXEC} "${IPTABLES} -A OUTPUT -s ${UNIVERSE} -d ${UNIVERSE} -j REG-LOG"
+        else
+                ${EXEC} "${ECHO} -e \"      - All other outgoing dropped\""
+                ${EXEC} "${IPTABLES} -A OUTPUT -s ${UNIVERSE} -d ${UNIVERSE} -j DROP"
+        fi
+fi
+
+#######################################################################
+
+${EXEC} "${ECHO} -e \"\nDone.\n\""
+
